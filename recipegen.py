@@ -1,104 +1,94 @@
-from flask import Flask, request, jsonify, render_template
-import pytesseract as tess
-tess.pytesseract.tesseract_cmd=r'C:\\Program Files\\Tesseract-OCR\\tesseract.exe'
-from PIL import Image
-import openai
 import os
-from openai import OpenAI
-from dotenv import load_dotenv, find_dotenv
-_ = load_dotenv(find_dotenv())
-openai.api_key = os.getenv("OPENAI_API_KEY")
-client = OpenAI()
+from flask import Flask, request, jsonify, send_from_directory, abort
+from werkzeug.utils import secure_filename
+import openai
+from functools import wraps
 
+# Load configuration from environment
+API_KEY = os.getenv('APP_API_KEY')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', 'uploads')
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'txt'}
 
 app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['DEBUG'] = False  # Turn off debug mode in production
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+openai.api_key = OPENAI_API_KEY
 
-@app.route('/index.html')
-def home():
-    return render_template('index.html')
+# Authentication decorator using a simple API key
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        key = request.headers.get('X-API-KEY')
+        if not key or key != API_KEY:
+            abort(401, description='Unauthorized')
+        return f(*args, **kwargs)
+    return decorated_function
 
-@app.route('/MealPlanNow.html')
-def MealPlanNow():
-    return render_template('MealPlanNow.html')
+# Utility: validate file extension
+def allowed_file(filename):
+    return ('.' in filename and \
+            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS)
 
-@app.route('/surveyChoices.html')
-def surveyChoices():
-    return render_template('surveyChoices.html')
+# Route to generate recipe
+@app.route('/generate_recipe', methods=['POST'])
+@require_api_key
+def generate_recipe():
+    data = request.get_json()
+    if not data or 'ingredients' not in data:
+        abort(400, description='Missing ingredients field')
 
-@app.route('/survey.html')
-def survey():
-    return render_template('survey.html')
+    # Input validation: ensure ingredients is a list of strings
+    ingredients = data['ingredients']
+    if not isinstance(ingredients, list) or not all(isinstance(i, str) for i in ingredients):
+        abort(400, description='Invalid ingredients format')
 
-@app.route('/survey1.html')
-def survey1():
-    return render_template('survey1.html')
+    # Sanitize and build prompt safely
+    safe_ingredients = [i.strip() for i in ingredients]
+    system_prompt = 'You are a helpful cooking assistant.'
+    user_prompt = f"Create a recipe using only: {', '.join(safe_ingredients)}."
 
-@app.route('/survey2.html')
-def survey2():
-    return render_template('survey2.html')
+    try:
+        response = openai.ChatCompletion.create(
+            model='gpt-3.5-turbo',
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        recipe = response.choices[0].message.content
+        return jsonify({'recipe': recipe})
+    except openai.error.OpenAIError as e:
+        abort(502, description=f'AI service error: {e}')
 
-
-@app.route('/extract', methods=['POST'])
-def extract():
-    data = request.json
-    items = data.get('items', [])
-    
-    # Process the list items as needed
-    print("Extracted items:", items)
-    
-    prompt = f"Given these items, {items} give me 3 links that follow to three compeetly different specific recipe websites that uses these foods, then a list of the name of the dish that eash reipce makes. Format it such that on the first line is just the three links seperated by just commas, no spaces. Then, on the next line, give me the three titles of the recicpes separated by commas no spaces. DO NOT have a number such as 1. in front nof each line. There should be a total of two lines in the output text"
-
-    response = client.chat.completions.create(
-    model="gpt-4o",
-    
-    messages=[
-        {
-        "role": "system",
-        "content": prompt}
-    ],
-    temperature=0.7,
-    max_tokens=1000,
-    top_p=1
-    )
-    data = response.choices[0].message.content
-    print(data)
-
-    links = list((data.split('\n'))[0].split(","))
-    titles = list((data.split('\n'))[-1].split(","))
-    print(links)
-    print(links[0])
-    print(links[1])
-    # Return a response
-
-    infos = {
-        't1': titles[0],
-        't2':titles[1],
-        't3':titles[2],
-        'l1':links[0],
-        'l2':links[1],
-        'l3':links[2]
-    }
-
-    return jsonify(infos)
-
-
-
+# Route to upload files securely
 @app.route('/upload', methods=['POST'])
-def upload():
-    imagefile = request.files.get('file')
-        #imagefile = request.files.get('imagefile', '')
-    content = request.form.get("myFile")
-    img = Image.open(imagefile)
-    print("YESYESYEYSEYEYSY")
-    text = tess.image_to_string(img, config='--tessdata-dir "C:\\Program Files\\Tesseract-OCR\\tessdata"')
-    print(text)
-    return jsonify({"status": "success", "text": text})
+@require_api_key
+def upload_file():
+    if 'file' not in request.files:
+        abort(400, description='No file part')
+    file = request.files['file']
+    if file.filename == '':
+        abort(400, description='No selected file')
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+        file.save(file_path)
+        return jsonify({'message': 'File uploaded', 'filename': filename})
+    else:
+        abort(400, description='File type not allowed')
 
-
+# Route to download files, restricted
+@app.route('/files/<filename>', methods=['GET'])
+@require_api_key
+def get_file(filename):
+    # Serve only files with allowed extensions
+    if not allowed_file(filename):
+        abort(403, description='Forbidden file type')
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Use a production WSGI server instead of Flask built-in
+    app.run(host='0.0.0.0', port=5000)
